@@ -1,12 +1,14 @@
 ---
 name: token-cost-optimization
 description: Use when you need to reduce LLM API token usage or costs — prompt compression, model tiering, caching, context trimming, tool call minimization, output length control, and automated context compression via headroom-ai.
-version: 1.0.0
-author: Hermes Agent
+version: 1.0.1
+author: protick-bjit2019
 license: MIT
+platforms: [linux, macos, windows]
 metadata:
   hermes:
     tags: [tokens, cost, llm, optimization, prompting, caching, context, headroom, compression, context-window]
+    homepage: https://github.com/protick-bjit2019/token-cost-optimization
     related_skills: [andrej-karpathy, plan, spike]
 ---
 
@@ -511,11 +513,35 @@ Run this mental checklist before deploying any LLM feature:
 
 ---
 
+## Smoke Test Report Format
+
+When producing a token cost smoke test report, always use this exact format:
+
+- **Header emoji:** `🧪` for test header, `📥` BEFORE, `📤` AFTER, `📊` DELTA, `🗄️` caching strategy, `🏷️` model tiering, `✅` checklist
+- **Label:** `Prompt tokens` (NOT `Total tokens`)
+- **Messages count:** include system as message 1 → `Messages: N  (incl. system)`
+- **Compression rows:** `Rows kept: N/M  (X% removed)  |  errors always kept: N`
+- **Model/pricing:** ALWAYS use the user's actual active model and Anthropic pricing — never default to GPT-4o or OpenAI pricing
+- **Indent:** 3 spaces inside each section block
+
+Example BEFORE block:
+```
+📥 BEFORE  (raw, no optimization)
+──────────────────────────────────────────────────────────────
+   Messages          : 5  (incl. system)
+   Prompt tokens     : 24,186
+   ↳ tool output     : 23,665  (98% of total)
+   ↳ system prompt   : 24
+   Est. cost / call  : $0.07256  (@ $3.0/1M in)
+```
+
+---
+
 ## Support Files
 
 | File | Purpose |
-|------|---------|
-| `templates/smoke_test_token_opt.py` | Runnable BEFORE/AFTER smoke test (tiktoken only, no headroom install needed). Copy and run: `python smoke_test_token_opt.py` |
+|------|---------| 
+| `templates/smoke_test_token_opt.py` | Runnable BEFORE/AFTER smoke test (tiktoken only, no headroom install needed). Uses emoji headers and Anthropic claude-sonnet-4-5 pricing by default. Copy and run: `python smoke_test_token_opt.py` |
 | `references/headroom-ai.md` | headroom-ai architecture notes, benchmarks, all 3 usage modes, Windows MSVC install fix, SDK integrations, CCR detail |
 
 ---
