@@ -1,7 +1,7 @@
 ---
 name: token-cost-optimization
 description: Use when you need to reduce LLM API token usage or costs — prompt compression, model tiering, caching, context trimming, tool call minimization, output length control, and automated context compression via headroom-ai.
-version: 1.1.0
+version: 1.2.0
 author: protick-bjit2019
 license: MIT
 platforms: [linux, macos, windows]
@@ -125,7 +125,7 @@ print(f"Modified  : {result.was_modified}")
 **Mode 1b — HeadroomClient (full-featured drop-in):**
 
 ```python
-from headroom import HeadroomClient, HeadroomConfig, SmartCrusherConfig
+from headroom import HeadroomClient, SmartCrusherConfig
 
 client = HeadroomClient(
     default_mode="optimize",          # "audit" | "optimize" | "simulate"
@@ -222,6 +222,11 @@ headroom proxy --port 8787
 # --llmlingua-rate 0.3        Target compression ratio
 # --backend bedrock           bedrock | vertex_ai | azure | openrouter
 # --no-telemetry              Disable anonymous telemetry
+# --no-optimize               Disable all compression (pass-through only)
+# --no-cache                  Disable CCR cache
+# --no-rate-limit             Disable rate limiting
+# --no-compress-first         Skip compression; apply caching only
+# --openai-api-url URL        Upstream OpenAI-compatible base URL
 
 # Point any OpenAI-compatible client at it
 OPENAI_BASE_URL=http://localhost:8787/v1 your-app
@@ -378,6 +383,83 @@ ctx.keys(); ctx.clear()
 # openrouter — 400+ models
 ```
 
+### Relevance Scoring API
+
+Score messages/chunks by relevance before compression to keep the most important content.
+
+```python
+from headroom.relevance import BM25Scorer, EmbeddingScorer, HybridScorer, create_scorer
+
+# BM25 — keyword-based, no GPU, fast
+scorer = BM25Scorer()
+scores = scorer.score(query="error root cause", documents=chunks)
+
+# Embedding — semantic, requires [relevance] extra
+scorer = EmbeddingScorer(model="all-MiniLM-L6-v2")
+scores = scorer.score(query="error root cause", documents=chunks)
+
+# Hybrid — BM25 + embedding blend (best accuracy, slightly slower)
+scorer = HybridScorer(bm25_weight=0.4, embedding_weight=0.6)
+scores = scorer.score(query="error root cause", documents=chunks)
+
+# Factory helper — infers best scorer from available deps
+scorer = create_scorer("hybrid")   # "bm25" | "embedding" | "hybrid"
+ranked = sorted(zip(scores, chunks), reverse=True)
+top_k  = [c for _, c in ranked[:10]]
+```
+
+Install extras for richer scoring:
+```bash
+pip install "headroom-ai[relevance]"   # embedding scorer (all-MiniLM-L6-v2)
+```
+
+---
+
+### TransformPipeline — custom compression chains
+
+Chain multiple compressors into a single pipeline with fallback logic.
+
+```python
+from headroom import TransformPipeline, SmartCrusher, LogCompressor, SearchCompressor
+
+pipeline = TransformPipeline([
+    SearchCompressor(),   # try search-result format first
+    LogCompressor(),      # fall back to log clustering
+    SmartCrusher(),       # final fallback for generic content
+])
+
+result = pipeline.compress(raw_text, query="deployment error")
+print(result.compressed)   # uses whichever stage matched
+print(result.strategy)     # e.g. "search_compressor" | "log_compressor" | "smart_crusher"
+```
+
+---
+
+### UniversalCompressor — multi-type batch
+
+Automatically detect content type and apply the right compressor per item.
+
+```python
+from headroom import UniversalCompressor
+
+uc = UniversalCompressor()
+
+# Single item — auto-detects type (JSON, log, diff, code, HTML, text)
+result = uc.compress(raw_content, query="why did the build fail?")
+
+# Batch — mixed types in one call
+results = uc.compress_batch([
+    tool_output_json,
+    build_log_text,
+    git_diff_text,
+    html_page,
+], query="deployment failure")
+
+# Each result has .compressed, .strategy, .was_modified, .original
+```
+
+---
+
 ### Provider cache optimization (built-in)
 
 After compression, headroom automatically applies provider-specific cache hints:
@@ -391,7 +473,7 @@ After compression, headroom automatically applies provider-specific cache hints:
 ### Cross-agent shared memory
 
 ```python
-from headroom.memory import SharedContext
+from headroom import SharedContext
 
 ctx = SharedContext()
 ctx.put("key", value, agent="claude")      # store from any agent
@@ -418,6 +500,7 @@ ctx.get("key")                              # retrieve from any agent (Claude, C
 headroom learn --project ./my-repo   # dry-run: show recommendations
 headroom learn --apply               # write to CLAUDE.md / AGENTS.md / GEMINI.md
 headroom learn --all                 # analyze all discovered projects
+headroom learn --claude-dir PATH     # override path to write/read CLAUDE.md
 ```
 
 - Mines failed sessions from `~/.claude/projects/*.jsonl`
@@ -482,6 +565,48 @@ generate_report(format="html", period="day")   # or "markdown"
 ```
 
 ---
+
+### Error Handling
+
+Always catch headroom-specific exceptions to degrade gracefully (pass-through if compression fails).
+
+```python
+from headroom.exceptions import (
+    HeadroomError,              # base exception for all headroom errors
+    HeadroomConnectionError,    # proxy / network unreachable
+    HeadroomConfigError,        # invalid configuration (bad env var, missing field)
+    HeadroomCompressionError,   # compressor raised an error (bad input, type mismatch)
+    HeadroomMemoryError,        # memory backend unavailable or read/write failure
+    HeadroomRateLimitError,     # proxy rate limit exceeded (--no-rate-limit to disable)
+    HeadroomBudgetError,        # daily spend cap reached (--budget flag)
+)
+
+try:
+    result = crusher.crush(tool_output, query=query)
+    compressed = result.compressed
+except HeadroomCompressionError:
+    compressed = tool_output   # graceful fallback — pass raw content through
+except HeadroomConnectionError:
+    # proxy is down — switch to direct client
+    compressed = tool_output
+except HeadroomError as e:
+    # catch-all for any headroom issue
+    compressed = tool_output
+```
+
+| Exception | When it fires | Graceful fallback |
+|---|---|---|
+| `HeadroomError` | Base — any headroom issue | Pass raw content through |
+| `HeadroomConnectionError` | Proxy unreachable / network down | Direct LLM call |
+| `HeadroomConfigError` | Bad env var, missing required field | Log + skip compression |
+| `HeadroomCompressionError` | Bad input type, compressor failure | Pass raw content through |
+| `HeadroomMemoryError` | SQLite/HNSW backend failure | Skip memory ops, continue |
+| `HeadroomRateLimitError` | Proxy rate limit exceeded | Retry with backoff |
+| `HeadroomBudgetError` | Daily `--budget` cap reached | Switch to cheaper tier |
+
+---
+
+## Strategy 1 — Measure First
 
 Never optimize blind. Instrument token usage before changing anything.
 
@@ -981,25 +1106,25 @@ See `references/hermes-session-db.md` for the full DB schema and query patterns.
    Confirmed working on Windows 10 with Python 3.11.15, uv, no MSVC installed.
    Full details: `references/headroom-ai.md`.
 
-3. **`crush_array_json()` inflates tokens — use `crush()` instead.** `crush_array_json()` returns a `dict` with `items`, `ccr_hash`, `dropped_summary`, `strategy_info`, `compacted`, and `compaction_kind` keys. Serialising this dict adds ~50% overhead. Confirmed with real data: 17,062 raw tokens → 25,589 after `crush_array_json()` vs → 10,688 after `crush()`. Always call `.crush(text, query="...")` and use `.compressed` from the result.
+6. **`crush_array_json()` inflates tokens — use `crush()` instead.** `crush_array_json()` returns a `dict` with `items`, `ccr_hash`, `dropped_summary`, `strategy_info`, `compacted`, and `compaction_kind` keys. Serialising this dict adds ~50% overhead. Confirmed with real data: 17,062 raw tokens → 25,589 after `crush_array_json()` vs → 10,688 after `crush()`. Always call `.crush(text, query="...")` and use `.compressed` from the result.
 
-4. **LLMLingua-2 cold start (~10–30s, ~2GB RAM).** Only enable `--llmlingua` on the proxy when running persistent long sessions. Don't use it for one-off scripts — the startup overhead negates savings.
+7. **LLMLingua-2 cold start (~10–30s, ~2GB RAM).** Only enable `--llmlingua` on the proxy when running persistent long sessions. Don't use it for one-off scripts — the startup overhead negates savings.
 
-5. **Compressing user messages.** headroom never touches user messages for a reason — user intent must be preserved exactly. Don't manually truncate or rewrite user input.
+8. **Compressing user messages.** headroom never touches user messages for a reason — user intent must be preserved exactly. Don't manually truncate or rewrite user input.
 
-3. **Optimizing before measuring.** You often don't know where tokens actually go until you log `response.usage` or run `headroom perf`. Profile first.
+9. **Optimizing before measuring.** You often don't know where tokens actually go until you log `response.usage` or run `headroom perf`. Profile first.
 
-4. **Caching dynamic content.** Prompt caching only helps if the prefix is truly static. If user ID / session info is in the system prompt prefix, the cache never hits. headroom's CacheAligner automatically moves dynamic content to the tail to fix this.
+10. **Caching dynamic content.** Prompt caching only helps if the prefix is truly static. If user ID / session info is in the system prompt prefix, the cache never hits. headroom's CacheAligner automatically moves dynamic content to the tail to fix this.
 
-5. **Setting `max_tokens` too low.** If the model hits the limit mid-sentence the output is truncated and often useless. Set it generously for tasks that need complete responses.
+11. **Setting `max_tokens` too low.** If the model hits the limit mid-sentence the output is truncated and often useless. Set it generously for tasks that need complete responses.
 
-6. **Ignoring completion-token cost.** For some providers, completion tokens cost 3-5× more per token than input tokens. A 100-token completion can cost more than a 400-token prompt. Control output length aggressively.
+12. **Ignoring completion-token cost.** For some providers, completion tokens cost 3-5× more per token than input tokens. A 100-token completion can cost more than a 400-token prompt. Control output length aggressively.
 
-7. **Stripping context that's actually needed.** Over-aggressive trimming causes the model to lose track of key facts, leading to retries that cost more than you saved. headroom's CCR (Compress-Cache-Retrieve) avoids this by storing originals and letting the LLM retrieve them on demand.
+13. **Stripping context that's actually needed.** Over-aggressive trimming causes the model to lose track of key facts, leading to retries that cost more than you saved. headroom's CCR (Compress-Cache-Retrieve) avoids this by storing originals and letting the LLM retrieve them on demand.
 
-8. **Forgetting tool schema tokens.** Each tool in the `tools=` array is tokenized into the prompt. 10 tools × 200 tokens = 2,000 tokens added to every request silently.
+14. **Forgetting tool schema tokens.** Each tool in the `tools=` array is tokenized into the prompt. 10 tools × 200 tokens = 2,000 tokens added to every request silently.
 
-9. **Not testing after compression.** Always re-run evals after changing prompts. headroom's `python -m headroom.evals suite` and benchmark table can validate accuracy preservation automatically.
+15. **Not testing after compression.** Always re-run evals after changing prompts. headroom's `python -m headroom.evals suite` and benchmark table can validate accuracy preservation automatically.
 
 ---
 
