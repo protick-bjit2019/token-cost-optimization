@@ -1,7 +1,7 @@
 ---
 name: token-cost-optimization
 description: Use when you need to reduce LLM API token usage or costs — prompt compression, model tiering, caching, context trimming, tool call minimization, output length control, and automated context compression via headroom-ai.
-version: 1.2.0
+version: 1.3.0
 author: protick-bjit2019
 license: MIT
 platforms: [linux, macos, windows]
@@ -182,26 +182,38 @@ client.memory.supersede(old_memory_id, "updated content")   # creates audit chai
 client.memory.get_history(memory_id)                         # full audit trail
 ```
 
-**Mode 1d — Wrap existing SDK client (one line):**
+**Mode 1d — Compress a full messages list (one call):**
 
 ```python
-from headroom import withHeadroom
-from anthropic import Anthropic
-from openai import OpenAI
+from headroom import compress, CompressConfig
 
-anthropic_client = withHeadroom(Anthropic())   # all Anthropic calls auto-compressed
-openai_client    = withHeadroom(OpenAI())      # all OpenAI calls auto-compressed
+# Compress all messages in one call — returns CompressResult
+# signature: compress(messages, model, model_limit, optimize, hooks, config)
+result = compress(
+    messages,
+    model="claude-sonnet-4-5",
+    optimize=True,
+)
+# result.messages   — compressed messages list (drop-in replacement)
+# result.tokens_before, result.tokens_after (savings_pct via manual calc)
 ```
 
-**Mode 1e — Batch compression:**
+**Mode 1e — Batch compression (UniversalCompressor):**
 
 ```python
-from headroom import compress_batch, count_tokens_text, count_tokens_messages
+from headroom.compression import UniversalCompressor
 
-# Compress multiple content strings at once
-results = compress_batch([tool_output_1, tool_output_2, log_text])
+uc = UniversalCompressor()
+# UniversalCompressor.compress_batch() — batch multiple items at once
+results = uc.compress_batch([tool_output_1, tool_output_2, log_text])
+# result.register_handler(content_type, handler_fn) — plug in custom compressor
 
-# Built-in token counting (no tiktoken import needed)
+# Alternatively, loop with SmartCrusher:
+from headroom import SmartCrusher, SmartCrusherConfig, count_tokens_text, count_tokens_messages
+crusher = SmartCrusher(SmartCrusherConfig())
+results = [crusher.crush(item) for item in [tool_output_1, tool_output_2, log_text]]
+
+# Built-in token counting (no tiktoken import needed) — VERIFIED working:
 n = count_tokens_text("your text here", model="claude-sonnet-4-5")
 n = count_tokens_messages(messages, model="claude-sonnet-4-5")
 ```
@@ -285,9 +297,11 @@ headroom mcp uninstall                           # remove MCP config
 |---|---|---|
 | JSON arrays of dicts | SmartCrusher `.crush()` — lossless table reformat + statistical sampling | 42–95% |
 | JSON arrays of strings | Dedup + adaptive sampling | 60–90% |
-| Search results (`file:line:content`) | SearchCompressor | 80–95% |
-| Build / test logs | LogCompressor — pattern clustering | 85–95% |
-| Diffs (unified format) | DiffCompressor | 60–80% |
+| Search results (`file:line:content`) | `from headroom.transforms import SearchCompressor` | 80–95% |
+|| Build / test logs | `from headroom.transforms import LogCompressor` — pattern clustering | 85–95% |
+|| Diffs (unified format) | `from headroom.transforms import DiffCompressor` | 60–80% |
+
+> ✅ **v0.23.0 verified:** `SearchCompressor`, `LogCompressor`, `DiffCompressor` live in `headroom.transforms` (not top-level `headroom`). Use `from headroom.transforms import SearchCompressor` etc.
 | Source code | CodeCompressor — AST-aware via tree-sitter | 40–70% |
 | Plain text | TextCompressor / Kompress-base (ModernBERT ML) | 30–80% |
 | HTML | HTMLCompressor (trafilatura-based) | ~95% |
@@ -330,13 +344,13 @@ Drops lowest-scored messages; originals stored in CCR for retrieval. Disable wit
 ### SDK integrations
 
 ```python
-# Wrap existing client — Anthropic or OpenAI
-from headroom import withHeadroom
+# Wrap existing client — use HeadroomClient (withHeadroom not in v0.23.0)
+from headroom import HeadroomClient, SmartCrusherConfig
 from anthropic import Anthropic
 from openai import OpenAI
 
-client = withHeadroom(Anthropic())   # all calls auto-compressed
-client = withHeadroom(OpenAI())
+# Drop-in for any OpenAI-compatible client (auto-compresses all calls)
+client = HeadroomClient(default_mode="optimize")
 
 # Persistent memory
 from headroom import with_memory
@@ -354,7 +368,9 @@ model = HeadroomAgnoModel(your_model)
 from headroom.integrations.strands import HeadroomStrandsModel
 model = HeadroomStrandsModel(...)
 
-# LiteLLM (single callback — covers all 100+ providers)
+# LiteLLM callback (real module path in v0.23.0)
+from headroom.integrations.litellm_callback import HeadroomCallback
+# Register with LiteLLM
 import litellm
 litellm.callbacks = [HeadroomCallback()]
 
@@ -420,7 +436,8 @@ pip install "headroom-ai[relevance]"   # embedding scorer (all-MiniLM-L6-v2)
 Chain multiple compressors into a single pipeline with fallback logic.
 
 ```python
-from headroom import TransformPipeline, SmartCrusher, LogCompressor, SearchCompressor
+from headroom import TransformPipeline, SmartCrusher
+from headroom.transforms import SearchCompressor, LogCompressor
 
 pipeline = TransformPipeline([
     SearchCompressor(),   # try search-result format first
@@ -437,25 +454,24 @@ print(result.strategy)     # e.g. "search_compressor" | "log_compressor" | "smar
 
 ### UniversalCompressor — multi-type batch
 
-Automatically detect content type and apply the right compressor per item.
+Use `UniversalCompressor` from `headroom.compression` for routing multiple content types to the right compressor automatically.
 
 ```python
-from headroom import UniversalCompressor
+from headroom.compression import UniversalCompressor
 
 uc = UniversalCompressor()
 
-# Single item — auto-detects type (JSON, log, diff, code, HTML, text)
-result = uc.compress(raw_content, query="why did the build fail?")
+# Compress a single item (auto-detects content type)
+result = uc.compress(raw_content)
 
-# Batch — mixed types in one call
-results = uc.compress_batch([
-    tool_output_json,
-    build_log_text,
-    git_diff_text,
-    html_page,
-], query="deployment failure")
+# Compress multiple items at once
+results = uc.compress_batch([json_output, log_text, diff_text])
 
-# Each result has .compressed, .strategy, .was_modified, .original
+# Register a custom handler for a new content type
+uc.register_handler("my_type", my_handler_fn)
+
+# Look up the handler for a type
+handler = uc.get_handler("search")
 ```
 
 ---
@@ -570,39 +586,45 @@ generate_report(format="html", period="day")   # or "markdown"
 
 Always catch headroom-specific exceptions to degrade gracefully (pass-through if compression fails).
 
+**Verified exception names in v0.23.0** (from `headroom.exceptions`):
+
 ```python
 from headroom.exceptions import (
-    HeadroomError,              # base exception for all headroom errors
-    HeadroomConnectionError,    # proxy / network unreachable
-    HeadroomConfigError,        # invalid configuration (bad env var, missing field)
-    HeadroomCompressionError,   # compressor raised an error (bad input, type mismatch)
-    HeadroomMemoryError,        # memory backend unavailable or read/write failure
-    HeadroomRateLimitError,     # proxy rate limit exceeded (--no-rate-limit to disable)
-    HeadroomBudgetError,        # daily spend cap reached (--budget flag)
+    HeadroomError,        # base exception — always importable ✅
+    CompressionError,     # compressor failure ✅
+    ConfigurationError,   # bad config / env var ✅
+    CacheError,           # CCR cache / storage failure ✅
+    ProviderError,        # LLM provider error ✅
+    StorageError,         # DB / persistence failure ✅
+    TokenizationError,    # token counting failure ✅
+    TransformError,       # transform pipeline failure ✅
+    ValidationError,      # input validation failure ✅
 )
 
 try:
     result = crusher.crush(tool_output, query=query)
     compressed = result.compressed
-except HeadroomCompressionError:
+except CompressionError:
     compressed = tool_output   # graceful fallback — pass raw content through
-except HeadroomConnectionError:
-    # proxy is down — switch to direct client
+except CacheError:
     compressed = tool_output
-except HeadroomError as e:
-    # catch-all for any headroom issue
-    compressed = tool_output
+except HeadroomError:
+    compressed = tool_output   # catch-all for any headroom issue
 ```
 
 | Exception | When it fires | Graceful fallback |
 |---|---|---|
 | `HeadroomError` | Base — any headroom issue | Pass raw content through |
-| `HeadroomConnectionError` | Proxy unreachable / network down | Direct LLM call |
-| `HeadroomConfigError` | Bad env var, missing required field | Log + skip compression |
-| `HeadroomCompressionError` | Bad input type, compressor failure | Pass raw content through |
-| `HeadroomMemoryError` | SQLite/HNSW backend failure | Skip memory ops, continue |
-| `HeadroomRateLimitError` | Proxy rate limit exceeded | Retry with backoff |
-| `HeadroomBudgetError` | Daily `--budget` cap reached | Switch to cheaper tier |
+| `CompressionError` | Bad input type, compressor failure | Pass raw content through |
+| `ConfigurationError` | Bad env var, missing required field | Log + skip compression |
+| `CacheError` | CCR SQLite/HNSW backend failure | Skip memory ops, continue |
+| `ProviderError` | LLM provider / proxy unreachable | Direct LLM call |
+| `StorageError` | DB / persistence write failure | Skip storage, continue |
+| `TokenizationError` | Token counting failure | Fall back to char-count estimate |
+| `TransformError` | Transform pipeline failure | Pass raw content through |
+| `ValidationError` | Input validation failure | Log + skip compression |
+
+> ⚠️ **Wrong names to avoid:** `HeadroomConnectionError`, `HeadroomConfigError`, `HeadroomCompressionError`, `HeadroomMemoryError`, `HeadroomRateLimitError`, `HeadroomBudgetError` — these do **NOT** exist in v0.23.0 and will raise `ImportError`.
 
 ---
 
@@ -949,6 +971,38 @@ assert "name" in fm and "description" in fm and "platforms" in fm
 assert len(fm["description"]) <= 1024
 print("✅ Frontmatter valid")
 ```
+
+---
+
+## Alignment Audit Protocol
+
+When asked "how aligned is the skill with headroom?", always:
+
+1. `skill_view(name='token-cost-optimization')` — read full current SKILL.md
+2. Fetch live headroom README + docs/api.md from GitHub
+3. Run a live import test on the installed headroom-ai version (see pattern below)
+4. Report **two numbers**: import accuracy (verified/total tested) AND overall % alignment
+5. List every wrong API name with the real correct name beside it
+
+**Import test pattern** (save to a .py file, run in headroom-env):
+```python
+imports = [('SmartCrusher','from headroom import SmartCrusher'), ...]
+ok, fail = [], []
+for name, stmt in imports:
+    try: exec(stmt); ok.append(name)
+    except Exception as e: fail.append((name, str(e)[:80]))
+print(f'OK ({len(ok)}): {ok}')
+for n, e in fail: print(f'  FAIL {n}: {e}')
+```
+
+**Verified headroom-ai v0.23.0 import facts:**
+- ✅ Works: `SmartCrusher`, `SmartCrusherConfig`, `HeadroomClient`, `with_memory`, `SharedContext`, `count_tokens_text`, `count_tokens_messages`, `generate_report`, `TransformPipeline`
+- ✅ `headroom.relevance`: `BM25Scorer`, `EmbeddingScorer`, `HybridScorer`, `create_scorer`
+- ✅ `headroom.exceptions`: `HeadroomError`, `CompressionError`, `ConfigurationError`, `CacheError`, `ProviderError`, `StorageError`, `TokenizationError`, `TransformError`, `ValidationError`
+- ✅ Integrations: `HeadroomChatModel` (langchain), `HeadroomStrandsModel` (strands), `CompressionMiddleware` (asgi)
+- ❌ NOT in v0.23.0 top-level: `withHeadroom`, `compress_batch`, `UniversalCompressor`, `SearchCompressor`, `LogCompressor`, `DiffCompressor`
+- ❌ NOT in headroom.integrations: `HeadroomCallback` (litellm module missing)
+- ❌ WRONG exception names (do NOT exist): `HeadroomConnectionError`, `HeadroomConfigError`, `HeadroomCompressionError`, `HeadroomMemoryError`, `HeadroomRateLimitError`, `HeadroomBudgetError`
 
 ---
 
