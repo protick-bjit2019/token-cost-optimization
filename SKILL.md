@@ -66,20 +66,42 @@ Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[image]`, `[
 **Mode 1 — Library (minimal code change):**
 
 ```python
-from headroom import compress
+from headroom import SmartCrusher, SmartCrusherConfig
 
-result = compress(messages, model="gpt-4o")
+crusher = SmartCrusher(SmartCrusherConfig(
+    max_items_after_crush=20,   # keep top-N rows by importance
+    first_fraction=0.30,        # always keep first 30% of remaining budget
+    last_fraction=0.15,         # always keep last 15%
+    factor_out_constants=True,  # hoist repeated fields to save tokens
+))
 
-# result.messages is drop-in replacement for original messages
-response = client.chat.completions.create(
-    model="gpt-4o",
-    messages=result.messages,  # compressed
-)
+# ✅ Use .crush() — returns CrushResult
+result     = crusher.crush(tool_output_str, query="error root cause")
+compressed = result.compressed   # str — drop-in replacement for tool output
 
-# Inspect savings
-print(f"Tokens: {result.tokens_before} → {result.tokens_after}  "
-      f"({result.compression_ratio:.0%} saved)")
-print(f"Transforms applied: {result.transforms_applied}")
+# CrushResult attributes (confirmed v0.23.0):
+#   .compressed   — str, the compressed content
+#   .original     — str, the original content unchanged
+#   .strategy     — str, e.g. "lossless:table(200->len=31363)"
+#   .was_modified — bool, False if content was too small to compress
+
+# ⚠️  DO NOT use crush_array_json() — it returns a metadata dict that
+#     wraps the content in extra keys, increasing token count by 50%+.
+#     Always use crush() for tool outputs.
+
+# Inject compressed result into messages
+msgs_after = [
+    *msgs_before[:-1],   # keep all but the last tool-result message
+    {"role": "user", "content": [
+        {"type": "tool_result", "tool_use_id": tool_use_id,
+         "content": compressed}
+    ]},
+]
+response = client.messages.create(model="claude-sonnet-4-5", messages=msgs_after, ...)
+
+# Check what happened
+print(f"Strategy  : {result.strategy}")
+print(f"Modified  : {result.was_modified}")
 ```
 
 **Mode 2 — Proxy (zero code changes):**
@@ -111,7 +133,7 @@ headroom wrap copilot    # starts proxy + launches
 
 | Content type | Compressor | Typical savings |
 |---|---|---|
-| JSON arrays of dicts | SmartCrusher (statistical sampling) | 83–95% |
+| JSON arrays of dicts | SmartCrusher `.crush()` (lossless table reformat + statistical sampling) | 42–95% |
 | JSON arrays of strings | Dedup + adaptive sampling | 60–90% |
 | Build/test logs | Pattern clustering | 85–94% |
 | Source code | CodeCompressor (AST-aware) | 40–70% |
@@ -120,6 +142,8 @@ headroom wrap copilot    # starts proxy + launches
 | Short content (<200 tokens) | **Not compressed** (overhead > savings) | — |
 | User messages | **Never compressed** (intent preserved) | — |
 | System prompt content | **Preserved**; only dynamic parts relocated | — |
+
+> ⚠️ **crush_array_json() pitfall:** This method returns a metadata dict with an `items` key containing the original JSON as a string. It does NOT reduce tokens — it increases them by 50%+. Always use **`crush()`** for tool outputs.
 
 ### How the pipeline works internally
 
@@ -495,6 +519,108 @@ def safe_complete(messages: list[dict]) -> str:
 
 ---
 
+## Publishing a Skill to GitHub for Peer Sharing
+
+When sharing a skill via `hermes skills install <url>`, the SKILL.md **must** have complete frontmatter or peers get a warning:
+> "The file lacks proper Hermes SKILL.md frontmatter."
+
+Required frontmatter fields for clean peer install:
+
+```yaml
+---
+name: skill-name
+description: Use when ...   # ≤1024 chars, starts with "Use when"
+version: 1.0.0
+author: your-github-username
+license: MIT
+platforms: [linux, macos, windows]   # ← REQUIRED — missing = warning
+metadata:
+  hermes:
+    tags: [tag1, tag2]
+    homepage: https://github.com/you/skill-name
+    related_skills: [other-skill]
+---
+```
+
+**Publish workflow:**
+```bash
+# 1. Create repo with the skill files
+mkdir my-skill && cd my-skill
+cp ~/.hermes/skills/<category>/<name>/SKILL.md .
+cp -r references/ templates/ .        # include support files
+
+# 2. Write README.md with install command, smoke test results, file list
+# 3. Init, create remote, push
+git init && git add .
+git commit -m "feat: initial release"
+gh repo create my-skill --public --source . --push
+
+# 4. Peers install with:
+hermes skills install https://raw.githubusercontent.com/<user>/<repo>/master/SKILL.md
+```
+
+**Validate frontmatter before pushing:**
+```python
+import yaml, re, pathlib
+content = pathlib.Path("SKILL.md").read_text(encoding="utf-8")
+assert content.startswith("---")
+m = re.search(r'\n---\s*\n', content[3:])
+fm = yaml.safe_load(content[3:m.start()+3])
+assert "name" in fm and "description" in fm and "platforms" in fm
+assert len(fm["description"]) <= 1024
+print("✅ Frontmatter valid")
+```
+
+---
+
+## Smoke Test Output Format
+
+When reporting smoke test results, use this format (emoji headers, "Prompt tokens" label, system counted as a message):
+
+```
+==============================================================
+🧪 TOKEN COST OPTIMIZATION — SMOKE TEST
+   Model  : <model-name>
+   Pricing: $X/1M in · $Y/1M out · $Z/1M cache-read
+   Scenario: <description>
+==============================================================
+
+──────────────────────────────────────────────────────────────
+📥 BEFORE  (raw, no optimization)
+──────────────────────────────────────────────────────────────
+   Messages          : N  (incl. system)
+   Prompt tokens     : XX,XXX
+   ↳ tool output     : XX,XXX  (XX% of total)
+   ↳ system prompt   : XX
+   Est. cost / call  : $X.XXXXX
+
+──────────────────────────────────────────────────────────────
+📤 AFTER   (headroom SmartCrusher — Strategy 0)
+──────────────────────────────────────────────────────────────
+   Messages          : N  (incl. system)
+   Prompt tokens     : X,XXX
+   ↳ tool output     : X,XXX  (XX% of total)
+   Est. cost / call  : $X.XXXXX
+   Compression time  : X.XX ms
+   Rows kept         : XX/XXX  (XX% removed)  |  errors always kept: XX
+
+==============================================================
+📊 DELTA
+==============================================================
+   Tokens saved            : XX,XXX  (XX.X%)
+   Cost saved / call       : $X.XXXXX
+   Cost saved / 1,000 calls: $XX.XX
+   Cost saved /10,000 calls: $XXX.XX
+```
+
+Key formatting rules:
+- Use **model's actual pricing** — not GPT-4o pricing if user is on Claude
+- Count system prompt as **message 1** → `Messages: 5 (incl. system)`
+- Label is `Prompt tokens` not `Total tokens`
+- Rows format: `kept/original` not `original → kept`
+
+---
+
 ## Quick-Reference Checklist
 
 Run this mental checklist before deploying any LLM feature:
@@ -537,12 +663,52 @@ Example BEFORE block:
 
 ---
 
+## Strategy 11 — Measure Actual Spend from the Hermes Session DB
+
+When running through Hermes, every session's token counts are written to a local
+SQLite DB. Query it directly to see exactly how much you spent today, last 7
+days, or last 30 days — no API key or dashboard required.
+
+**DB location:**
+- Windows: `%LOCALAPPDATA%\hermes\state.db`
+- Linux/Mac: `~/.local/share/hermes/state.db`
+
+**Key columns in `sessions`:** `input_tokens`, `output_tokens`,
+`cache_read_tokens`, `cache_write_tokens`, `model`, `started_at`.
+
+**⚠️ Copilot billing caveat:** when `billing_provider = 'copilot'`,
+`estimated_cost_usd` is always `0.0`. Compute cost yourself from token counts
+using Anthropic API-equivalent pricing — this shows what it *would* cost on the
+direct API, not the Copilot subscription fee.
+
+**Cost formula:**
+```python
+cost = (
+    input_tokens        / 1e6 * price_in   +
+    output_tokens       / 1e6 * price_out  +
+    cache_write_tokens  / 1e6 * price_cw   +
+    cache_read_tokens   / 1e6 * price_cr
+)
+```
+
+Cache-read tokens can reach millions per session (every KV-cache hit is counted)
+but are cheap ($0.30/1M). Always include them — omitting understates cost by ~30%.
+
+See `templates/spend_report.py` for a full CLI tool with `--today / --7d / --30d`
+flags and a per-model daily bar-chart breakdown.
+See `references/hermes-session-db.md` for the full DB schema and query patterns.
+
+---
+
 ## Support Files
 
 | File | Purpose |
 |------|---------| 
 | `templates/smoke_test_token_opt.py` | Runnable BEFORE/AFTER smoke test (tiktoken only, no headroom install needed). Uses emoji headers and Anthropic claude-sonnet-4-5 pricing by default. Copy and run: `python smoke_test_token_opt.py` |
-| `references/headroom-ai.md` | headroom-ai architecture notes, benchmarks, all 3 usage modes, Windows MSVC install fix, SDK integrations, CCR detail |
+| `templates/cost_count.py` | CLI token counter — counts tokens and estimates cost for any text/JSON conversation. Accepts inline text, file, or stdin. Flags: `-f FILE`, `-m MODEL`, `--system TEXT`, `--list-models`. Requires `tiktoken`. |
+| `templates/spend_report.py` | CLI spend reporter — queries Hermes `state.db` for actual session token counts and computes $ cost. Flags: `--today`, `--7d`, `--30d`, `--all`, `--from`/`--to`. No extra deps beyond stdlib + sqlite3. |
+| `references/headroom-ai.md` | headroom-ai architecture, benchmarks, **confirmed Windows uv-venv install (no MSVC)**, SDK integrations |
+| `references/hermes-session-db.md` | Hermes state.db schema reference — cost-relevant columns, copilot billing caveat, cost computation pattern, model-name variations, cache-read token note. |
 
 ---
 
@@ -550,15 +716,20 @@ Example BEFORE block:
 
 1. **Not trying headroom first.** For any app that has tool calls, RAG results, or log output in context, headroom is almost always the highest-leverage first move. Install it and wrap your client before hand-tuning anything else.
 
-2. **headroom-ai fails to install on Windows (Rust/MSVC blocker).** The package uses Rust crates (Maturin/pyo3: `quote`, `serde_core`, `proc-macro2`). `pip install headroom-ai` and `uv pip install headroom-ai` both fail with:
+2. **headroom-ai on Windows — use `uv venv`, NOT bare `pip install`.** Bare `pip install headroom-ai` / `uv pip install headroom-ai --system` tries to compile Rust crates and fails without MSVC. But creating an isolated venv first pulls **pre-built wheels** and succeeds without any build tools:
+   ```bash
+   uv venv headroom-env --python 3.11
+   source headroom-env/Scripts/activate   # bash/git-bash
+   # OR: headroom-env\Scripts\activate.bat  (cmd)
+   uv pip install "headroom-ai[all]"
+   python -c "import headroom; print(headroom.__version__)"  # ✅ 0.23.0
    ```
-   error: linking with `link.exe` failed: exit code: 1
-   note: ensure the "C++ build tools" workload is selected in Visual Studio
-   ```
-   **Fix:** Install [VS Build Tools 2022](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022) → select **"Desktop development with C++"** workload → re-run install in a new terminal.
-   **Workaround (no MSVC):** Use the inline SmartCrusher in `templates/smoke_test_token_opt.py` (stdlib + tiktoken only), or run the headroom proxy on a separate Linux/Mac machine. Full details: `references/headroom-ai.md`.
+   Confirmed working on Windows 10 with Python 3.11.15, uv, no MSVC installed.
+   Full details: `references/headroom-ai.md`.
 
-3. **Compressing user messages.** headroom never touches user messages for a reason — user intent must be preserved exactly. Don't manually truncate or rewrite user input.
+3. **`crush_array_json()` inflates tokens — use `crush()` instead.** `crush_array_json()` returns a `dict` with `items`, `ccr_hash`, `dropped_summary`, `strategy_info`, `compacted`, and `compaction_kind` keys. Serialising this dict adds ~50% overhead. Confirmed with real data: 17,062 raw tokens → 25,589 after `crush_array_json()` vs → 10,688 after `crush()`. Always call `.crush(text, query="...")` and use `.compressed` from the result.
+
+4. **Compressing user messages.** headroom never touches user messages for a reason — user intent must be preserved exactly. Don't manually truncate or rewrite user input.
 
 3. **Optimizing before measuring.** You often don't know where tokens actually go until you log `response.usage` or run `headroom perf`. Profile first.
 
