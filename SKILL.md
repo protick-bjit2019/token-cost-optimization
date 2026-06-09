@@ -1,7 +1,7 @@
 ---
 name: token-cost-optimization
 description: Use when you need to reduce LLM API token usage or costs — prompt compression, model tiering, caching, context trimming, tool call minimization, output length control, and automated context compression via headroom-ai.
-version: 1.0.1
+version: 1.1.0
 author: protick-bjit2019
 license: MIT
 platforms: [linux, macos, windows]
@@ -54,12 +54,30 @@ Applies to any provider (OpenAI, Anthropic, Mistral, Gemini, etc.) and also to l
 ### Installation
 
 ```bash
-pip install "headroom-ai[all]"    # Python — everything included
-npm install headroom-ai           # TypeScript / Node (requires proxy)
-docker pull ghcr.io/chopratejas/headroom:latest
-```
+# Python (requires 3.10+)
+pip install "headroom-ai[all]"    # everything included
 
-Granular extras: `[proxy]`, `[mcp]`, `[ml]`, `[code]`, `[memory]`, `[image]`, `[langchain]`, `[agno]`, `[evals]`. Requires Python 3.10+.
+# Granular extras:
+# [proxy]     — proxy server + HTTP API
+# [ml]        — Kompress ModernBERT (requires PyTorch)
+# [code]      — CodeCompressor tree-sitter AST
+# [mcp]       — MCP server tools (lightweight)
+# [memory]    — persistent memory (SQLite + HNSW)
+# [relevance] — embedding-based relevance scoring
+# [image]     — image compression via ML router
+# [langchain] — HeadroomChatModel wrapper
+# [agno]      — HeadroomAgnoModel wrapper
+# [evals]     — GSM8K, SQuAD, BFCL eval suite
+# [llmlingua] — LLMLingua-2 ML compression (~2GB, 10-30s cold start)
+
+# TypeScript / Node.js (requires Node 18+)
+npm install headroom-ai       # communicates with local Python proxy
+
+# Docker
+docker pull ghcr.io/chopratejas/headroom:latest
+docker run -p 8787:8787 ghcr.io/chopratejas/headroom:latest
+# Tags: latest, <version>, nonroot, code, slim, code-slim (and -nonroot variants)
+```
 
 ### Three usage modes
 
@@ -104,46 +122,176 @@ print(f"Strategy  : {result.strategy}")
 print(f"Modified  : {result.was_modified}")
 ```
 
+**Mode 1b — HeadroomClient (full-featured drop-in):**
+
+```python
+from headroom import HeadroomClient, HeadroomConfig, SmartCrusherConfig
+
+client = HeadroomClient(
+    default_mode="optimize",          # "audit" | "optimize" | "simulate"
+    smart_crusher=SmartCrusherConfig(max_items_after_crush=20),
+)
+
+# Drop-in for any OpenAI-compatible client
+response = client.chat.completions.create(
+    model="claude-sonnet-4-5",
+    messages=messages,
+)
+
+# Preview savings without making an LLM call
+sim = client.chat.completions.simulate("claude-sonnet-4-5", messages)
+print(sim.tokens_before, sim.tokens_after, sim.compression_ratio)
+
+# Stats
+print(client.get_summary())   # total_tokens_saved, avg_compression_ratio, total_cost_saved_usd
+print(client.get_stats())     # session-level breakdown
+
+# Per-tool compression config (override per request)
+response = client.chat.completions.create(
+    ...,
+    headroom_tool_profiles={
+        "important_tool": {"skip_compression": True},
+        "search_tool":    {"max_items_after_crush": 25},
+    }
+)
+```
+
+**Mode 1c — Persistent Memory wrapper:**
+
+```python
+from headroom import with_memory
+from openai import OpenAI   # or Anthropic, Azure, Groq — any OpenAI-compatible client
+
+client = with_memory(OpenAI(), user_id="alice", session_id="session-42")
+
+# All calls now auto-extract and inject relevant memories
+response = client.chat.completions.create(model="gpt-4o", messages=messages)
+
+# Manual memory ops
+client.memory.add("User prefers concise answers", category="PREFERENCE", importance=0.9)
+client.memory.search("preferred coding style", top_k=5)
+client.memory.stats()
+client.memory.clear()
+
+# Memory scopes: User (all sessions) > Session > Agent > Turn
+# Categories: PREFERENCE, FACT, CONTEXT, ENTITY, DECISION, INSIGHT
+# Backends:   LOCAL (all-MiniLM-L6-v2) | OPENAI (text-embedding-3-small) | OLLAMA
+# Storage:    SQLite + HNSW (vector) + FTS5 (full-text) — fully embedded, no external services
+# Temporal versioning:
+client.memory.supersede(old_memory_id, "updated content")   # creates audit chain
+client.memory.get_history(memory_id)                         # full audit trail
+```
+
+**Mode 1d — Wrap existing SDK client (one line):**
+
+```python
+from headroom import withHeadroom
+from anthropic import Anthropic
+from openai import OpenAI
+
+anthropic_client = withHeadroom(Anthropic())   # all Anthropic calls auto-compressed
+openai_client    = withHeadroom(OpenAI())      # all OpenAI calls auto-compressed
+```
+
+**Mode 1e — Batch compression:**
+
+```python
+from headroom import compress_batch, count_tokens_text, count_tokens_messages
+
+# Compress multiple content strings at once
+results = compress_batch([tool_output_1, tool_output_2, log_text])
+
+# Built-in token counting (no tiktoken import needed)
+n = count_tokens_text("your text here", model="claude-sonnet-4-5")
+n = count_tokens_messages(messages, model="claude-sonnet-4-5")
+```
+
 **Mode 2 — Proxy (zero code changes):**
 
 ```bash
 # Start local proxy on port 8787
 headroom proxy --port 8787
 
+# All proxy options:
+# --host 0.0.0.0              Bind address
+# --budget 5.00               Daily USD spend cap
+# --log-file /tmp/hr.jsonl    JSONL request log
+# --no-intelligent-context    Fall back to RollingWindow
+# --llmlingua                 Enable LLMLingua-2 ML compression
+# --llmlingua-device auto     auto | cuda | cpu | mps
+# --llmlingua-rate 0.3        Target compression ratio
+# --backend bedrock           bedrock | vertex_ai | azure | openrouter
+# --no-telemetry              Disable anonymous telemetry
+
 # Point any OpenAI-compatible client at it
 OPENAI_BASE_URL=http://localhost:8787/v1 your-app
 ANTHROPIC_BASE_URL=http://localhost:8787 claude
 
-# Stats endpoint
-curl http://localhost:8787/stats
-# {"requests_total": 42, "tokens_saved_total": 125000, ...}
+# Bypass header for a specific request (skip compression)
+curl ... -H "x-headroom-bypass: true"
+
+# HTTP API endpoints
+GET  /health            # health check + session stats
+GET  /stats             # live savings (JSON)
+GET  /stats-history     # hourly/daily/weekly/monthly rollups (?format=csv&series=weekly)
+GET  /metrics           # Prometheus metrics
+GET  /dashboard         # savings dashboard
+POST /v1/compress       # compression-only, no LLM call (used by TS SDK)
 ```
 
 **Mode 3 — Agent wrap (one command):**
 
 ```bash
-headroom wrap claude     # wraps Claude Code with --memory and --code-graph
-headroom wrap codex      # shares memory with Claude
-headroom wrap cursor     # prints config, paste once
+headroom wrap claude     # Claude Code (--memory and --code-graph flags)
+headroom wrap codex      # OpenAI Codex (shares memory with Claude)
+headroom wrap cursor     # Cursor (prints config, paste once)
 headroom wrap aider      # starts proxy + launches
 headroom wrap copilot    # starts proxy + launches
+headroom wrap gemini     # Gemini
+headroom wrap openclaw   # installs as ContextEngine plugin
+```
+
+**Mode 4 — MCP server (Claude Code, Cursor, any MCP client):**
+
+```bash
+headroom mcp install                             # register with Claude Code (stdio)
+headroom mcp install --remote <url>              # configure remote HTTP MCP
+headroom mcp install --force                     # overwrite existing config
+headroom mcp serve                               # run MCP server (stdio)
+headroom mcp serve --transport http --port 8080  # HTTP transport for remote agents
+headroom mcp serve --debug                       # debug mode
+headroom mcp status                              # check server status
+headroom mcp uninstall                           # remove MCP config
+
+# MCP tools exposed to the LLM:
+# headroom_compress   — compress any content; returns hash + savings stats
+# headroom_retrieve   — retrieve original by hash (query="" for full, or filtered)
+# headroom_stats      — session stats: compressions, tokens_saved, cost_saved_usd
+
+# Transports:
+# stdio (local)              →  headroom mcp install → claude
+# Streamable HTTP (remote)   →  headroom mcp serve --transport http --port 8080
+# Via proxy (auto)           →  POST/GET/DELETE  http://host:8787/mcp
 ```
 
 ### What headroom compresses (and what it doesn't touch)
 
 | Content type | Compressor | Typical savings |
 |---|---|---|
-| JSON arrays of dicts | SmartCrusher `.crush()` (lossless table reformat + statistical sampling) | 42–95% |
+| JSON arrays of dicts | SmartCrusher `.crush()` — lossless table reformat + statistical sampling | 42–95% |
 | JSON arrays of strings | Dedup + adaptive sampling | 60–90% |
-| Build/test logs | Pattern clustering | 85–94% |
-| Source code | CodeCompressor (AST-aware) | 40–70% |
-| Plain text | Kompress-base (HuggingFace model) | 30–50% |
-| HTML | Article extraction (trafilatura) | ~95% |
+| Search results (`file:line:content`) | SearchCompressor | 80–95% |
+| Build / test logs | LogCompressor — pattern clustering | 85–95% |
+| Diffs (unified format) | DiffCompressor | 60–80% |
+| Source code | CodeCompressor — AST-aware via tree-sitter | 40–70% |
+| Plain text | TextCompressor / Kompress-base (ModernBERT ML) | 30–80% |
+| HTML | HTMLCompressor (trafilatura-based) | ~95% |
+| Images | Image ML Router | 40–90% |
 | Short content (<200 tokens) | **Not compressed** (overhead > savings) | — |
 | User messages | **Never compressed** (intent preserved) | — |
-| System prompt content | **Preserved**; only dynamic parts relocated | — |
+| System prompt content | **Preserved**; CacheAligner moves dynamic parts to tail | — |
 
-> ⚠️ **crush_array_json() pitfall:** This method returns a metadata dict with an `items` key containing the original JSON as a string. It does NOT reduce tokens — it increases them by 50%+. Always use **`crush()`** for tool outputs.
+> ⚠️ **crush_array_json() pitfall:** Returns a metadata dict wrapping the original JSON — increases tokens by 50%+. Always use **`crush()`** for tool outputs.
 
 ### How the pipeline works internally
 
@@ -151,11 +299,26 @@ Three-stage compression pipeline:
 
 1. **CacheAligner** — extracts dynamic content (dates, UUIDs, tokens) from system prompt prefix and moves it to the tail. Stabilizes prefixes so provider KV caches (Anthropic `cache_control`, OpenAI prefix cache) actually hit. Sub-millisecond overhead.
 
-2. **ContentRouter → SmartCrusher / CodeCompressor / Kompress-base** — detects content type, selects best compressor. SmartCrusher applies field-level statistical analysis (variance, uniqueness, Kneedle algorithm on bigram coverage). Errors and anomalies are always kept regardless of budget. Overhead: 1–50ms.
+### Stage 3: Context Management
 
-3. **Context Manager** — ensures final message array fits within the model's context window.
-   - *Rolling Window* (default): drops oldest messages first, preserving system prompt and recent turns. Tool call + response pairs dropped atomically.
-   - *Intelligent Context* (advanced): scores messages on 6 dimensions (recency, semantic similarity, TOIN importance, error indicators, forward references, token density).
+Two strategies — both configurable via `HeadroomClient` or env vars:
+
+**IntelligentContextManager** (default) — Scores messages on 6 dimensions before dropping:
+
+| Dimension | Weight |
+|---|---|
+| `recency` | 0.20 |
+| `semantic_similarity` | 0.20 |
+| `toin_importance` | 0.25 |
+| `error_indicator` | 0.15 |
+| `forward_reference` | 0.15 |
+| `token_density` | 0.05 |
+
+Drops lowest-scored messages; originals stored in CCR for retrieval. Disable with `--no-intelligent-context`.
+
+**RollingWindow** (fallback) — drops oldest messages first; preserves system prompt + recent turns.
+
+**TOIN (Tool Output Intelligence Network)** — learns compression patterns across sessions. Feeds learned field-importance stats into SmartCrusher and IntelligentContext scoring. Falls back to statistical heuristics on cold start.
 
 **CCR (Compress-Cache-Retrieve) — reversible compression:** originals are never deleted; they're stored in a local SQLite cache. If the LLM needs full data it calls `ccr_retrieve("<hash>")` to get it back. Headroom is the only major compressor that is fully reversible.
 
@@ -163,26 +326,56 @@ Three-stage compression pipeline:
 
 ```python
 # Wrap existing client — Anthropic or OpenAI
-from headroom.integrations import withHeadroom
+from headroom import withHeadroom
 from anthropic import Anthropic
+from openai import OpenAI
 
 client = withHeadroom(Anthropic())   # all calls auto-compressed
+client = withHeadroom(OpenAI())
+
+# Persistent memory
+from headroom import with_memory
+client = with_memory(OpenAI(), user_id="alice")
 
 # LangChain
 from headroom.integrations.langchain import HeadroomChatModel
-llm = HeadroomChatModel(your_llm)
+llm = HeadroomChatModel(your_llm)   # supports memory, retrievers, tools, streaming, async
 
 # Agno
 from headroom.integrations.agno import HeadroomAgnoModel
 model = HeadroomAgnoModel(your_model)
 
+# Strands
+from headroom.integrations.strands import HeadroomStrandsModel
+model = HeadroomStrandsModel(...)
+
+# LiteLLM (single callback — covers all 100+ providers)
+import litellm
+litellm.callbacks = [HeadroomCallback()]
+
+# Vercel AI SDK (TypeScript)
+import { withHeadroom, headroomMiddleware } from 'headroom-ai/vercel-ai';
+const model = withHeadroom(openai('gpt-4o'));
+// Or: wrapLanguageModel({ model, middleware: headroomMiddleware() })
+
 # ASGI middleware
 from headroom.integrations.asgi import CompressionMiddleware
 app.add_middleware(CompressionMiddleware)
 
-# MCP server (for any MCP client)
-headroom mcp install
-# Exposes: headroom_compress, headroom_retrieve, headroom_stats
+# Multi-agent / CrewAI / LangGraph / OpenAI Agents SDK — SharedContext
+from headroom import SharedContext
+ctx = SharedContext()
+ctx.put("key", big_content, agent="claude")
+ctx.get("key")          # compressed view
+ctx.get("key", full=True)  # original
+ctx.stats()             # entries, totalOriginalTokens, totalCompressedTokens, savingsPercent
+ctx.keys(); ctx.clear()
+
+# Cloud backends (via proxy --backend flag)
+# bedrock   — AWS Bedrock   (--region us-east-1)
+# vertex_ai — Google Vertex (--region us-central1)
+# azure     — Azure OpenAI
+# openrouter — 400+ models
 ```
 
 ### Provider cache optimization (built-in)
@@ -219,15 +412,76 @@ ctx.get("key")                              # retrieve from any agent (Claude, C
 
 > headroom ships RTK internally and can also use lean-ctx as the context tool (`HEADROOM_CONTEXT_TOOL=lean-ctx`).
 
-### Performance check
+### headroom learn (failure mining)
 
 ```bash
-headroom perf    # benchmark compression on your actual workloads
+headroom learn --project ./my-repo   # dry-run: show recommendations
+headroom learn --apply               # write to CLAUDE.md / AGENTS.md / GEMINI.md
+headroom learn --all                 # analyze all discovered projects
+```
+
+- Mines failed sessions from `~/.claude/projects/*.jsonl`
+- Learns: environment facts, file path corrections, search scope, command patterns, known large files
+- Updates files with marker blocks: `<!-- headroom:learn:start -->` … `<!-- headroom:learn:end -->`
+
+### headroom perf & evals
+
+```bash
+headroom perf                                    # benchmark compression on current session
+python -m headroom.evals suite --tier 1          # run GSM8K, TruthfulQA, SQuAD v2, BFCL
+pip install "headroom-ai[evals]"                 # required for evals
 ```
 
 ---
 
-## Strategy 1 — Measure First
+### Configuration & Environment Variables
+
+| Variable | Default | Description |
+|---|---|---|
+| `HEADROOM_DEFAULT_MODE` | `optimize` | `audit` \| `optimize` \| `simulate` |
+| `HEADROOM_STORE_URL` | temp dir | SQLite DB path for CCR + metrics |
+| `HEADROOM_API_KEY` | — | API key for Headroom Cloud |
+| `HEADROOM_LOG_LEVEL` | `INFO` | Logging level |
+| `HEADROOM_SAVINGS_PATH` | `~/.headroom/proxy_savings.json` | Persistent savings file |
+| `HEADROOM_TELEMETRY` | `on` | Set `off` to disable anonymous telemetry |
+| `HEADROOM_PORT` | `8787` | Proxy port |
+| `HEADROOM_HOST` | `0.0.0.0` | Proxy bind address |
+| `HEADROOM_CONTEXT_TOOL` | — | Set to `lean-ctx` to use lean-ctx CLI tool |
+| `OPENAI_API_KEY` | — | OpenAI key |
+| `ANTHROPIC_API_KEY` | — | Anthropic key |
+
+**Three modes explained:**
+| Mode | Behavior |
+|---|---|
+| `audit` | Observes and logs only — no modifications made |
+| `optimize` | Applies safe, deterministic transforms (default) |
+| `simulate` | Returns compression plan without making an LLM API call |
+
+**Custom model config** — `~/.headroom/models.json` or `HEADROOM_MODEL_LIMITS=<json>`:
+Pattern-based inference for unknown models (`*opus*`, `*sonnet*`, `gpt-4o*`, `o1*`, etc.)
+
+### Observability
+
+```python
+# Simulation mode — preview savings before committing
+sim = client.chat.completions.simulate("claude-sonnet-4-5", messages)
+print(f"Would save: {sim.tokens_before - sim.tokens_after} tokens")
+print(f"Waste signals: {sim.waste_signals}")
+# Waste signals: json_bloat_tokens, html_noise_tokens, whitespace_tokens,
+#                dynamic_date_tokens, repetition_tokens
+
+# Prometheus metrics (proxy)
+GET /metrics
+# headroom_requests_total, headroom_tokens_saved_total,
+# headroom_compression_ratio_bucket, headroom_latency_seconds_bucket,
+# headroom_cache_hits_total
+
+# Report generation
+from headroom import generate_report
+generate_report(format="html", period="day")   # or "markdown"
+```
+
+---
 
 Never optimize blind. Instrument token usage before changing anything.
 
@@ -729,7 +983,9 @@ See `references/hermes-session-db.md` for the full DB schema and query patterns.
 
 3. **`crush_array_json()` inflates tokens — use `crush()` instead.** `crush_array_json()` returns a `dict` with `items`, `ccr_hash`, `dropped_summary`, `strategy_info`, `compacted`, and `compaction_kind` keys. Serialising this dict adds ~50% overhead. Confirmed with real data: 17,062 raw tokens → 25,589 after `crush_array_json()` vs → 10,688 after `crush()`. Always call `.crush(text, query="...")` and use `.compressed` from the result.
 
-4. **Compressing user messages.** headroom never touches user messages for a reason — user intent must be preserved exactly. Don't manually truncate or rewrite user input.
+4. **LLMLingua-2 cold start (~10–30s, ~2GB RAM).** Only enable `--llmlingua` on the proxy when running persistent long sessions. Don't use it for one-off scripts — the startup overhead negates savings.
+
+5. **Compressing user messages.** headroom never touches user messages for a reason — user intent must be preserved exactly. Don't manually truncate or rewrite user input.
 
 3. **Optimizing before measuring.** You often don't know where tokens actually go until you log `response.usage` or run `headroom perf`. Profile first.
 
