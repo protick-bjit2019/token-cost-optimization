@@ -4,9 +4,9 @@ This guide covers the complete setup of `headroom-ai` context compression on Win
 
 ## 1. Prerequisites (Install `uv`)
 
-If you don't have `uv` installed yet, run this in your terminal:
-```bash
-curl -lsSf https://astral.sh/uv/install.sh | sh
+If you don't have `uv` installed yet, run this in PowerShell:
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```
 
 ## 2. Install Python 3.11
